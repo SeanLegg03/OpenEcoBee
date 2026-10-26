@@ -28,6 +28,8 @@ The operator deploys the Worker and configures GitHub OAuth once. End users do n
 
 The deployment starts with a closed user allowlist. Verify login, account isolation, and a deliberate thermostat command before broadening access.
 
+If ecobee requires another sign-in, open your hosted `/app` page, choose **Open ecobee sign-in**, complete login/MFA in the private browser, and choose **Finish connecting ecobee**. Use **Check connection** to verify the restored session. Ecobee sign-in is separate from ChatGPT authorization; reconnecting ecobee keeps your existing ChatGPT connection and thermostat permissions.
+
 ## MCP tools
 
 The server provides tools covering thermostat state and holds, eco+ master control, energy/automation inspection, Smart Recovery, comfort settings, weekly schedules, fan, sensors, vacations, alerts, messages, runtime reports, and documented settings. Use `get_capabilities` for the current catalog. See [feature coverage](docs/feature-coverage.md) for the distinction between implemented interfaces, live verification, device-specific support, and unverified eco+ subfeatures.

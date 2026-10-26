@@ -30,6 +30,8 @@ The browser backend loads ecobee's web portal, locates its Angular application, 
 
 This depends on undocumented application internals. A portal release can change service discovery, response shapes, or command behavior. Ecobee may reject cloud or automated browsers before login. The adapter must fail clearly when its assumptions no longer hold and does not bypass login, MFA, or access restrictions.
 
+Restored sessions can take one normal ecobee SSO renewal path before the portal is ready, including when the access-token cookie is missing or a page redirects to sign-in. An authenticated read verifies renewal before replacing the encrypted snapshot or dispatching the requested command. Network failures, slow redirects, and stale tokens preserve the original snapshot. A known interactive login/MFA challenge after renewal requires the user to reconnect through `/app`; thermostat writes are never replayed during recovery.
+
 REA is an optional reference for investigating the browser application. It is not bundled or required at runtime.
 
 ## Control boundary

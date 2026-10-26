@@ -260,6 +260,45 @@ export class ThermostatSession extends DurableObject<BrowserEnv> {
     });
   }
 
+  private portalLocation(page: Page): "portal" | "homepage" | "callback" | "auth" | "interactive" | "other" {
+    try {
+      const current = new URL(page.url());
+      if (current.protocol !== "https:") return "other";
+      if (current.hostname === "auth.ecobee.com") {
+        return /^\/u\/(?:login|mfa)/.test(current.pathname) ? "interactive" : "auth";
+      }
+      if (!["www.ecobee.com", "ecobee.com"].includes(current.hostname)) return "other";
+      if (current.pathname.startsWith("/consumerportal/")) return "portal";
+      if (current.pathname === "/home/authCallback") return "callback";
+      return "homepage";
+    } catch { return "other"; }
+  }
+
+  private async portalHasNoToken(page: Page): Promise<boolean> {
+    return withDeadline(page.evaluate(() => {
+      try {
+        if (location.protocol !== "https:" || !["www.ecobee.com", "ecobee.com"].includes(location.hostname) ||
+            !location.pathname.startsWith("/consumerportal/")) return false;
+        const angular = (window as Window & {
+          angular?: { element(element: Element | Document): { injector(): { get(name: string): unknown } | undefined } };
+        }).angular;
+        if (!angular) return false;
+        for (const element of [document.querySelector("[ng-app]"), document.body, document.documentElement, document]) {
+          if (!element) continue;
+          try {
+            const manager = angular.element(element).injector()?.get("connectionManagerAPI") as {
+              loadTokens?: () => void; haveToken?: () => boolean;
+            } | undefined;
+            if (typeof manager?.loadTokens !== "function" || typeof manager.haveToken !== "function") continue;
+            manager.loadTokens();
+            return manager.haveToken() === false;
+          } catch { /* An absent injector is a bootstrap failure, not proof of expiry. */ }
+        }
+      } catch { /* Browser state is unavailable; preserve the saved snapshot. */ }
+      return false;
+    }), 15_000, () => new PortalError("site_changed"));
+  }
+
   private async waitForPortalReady(page: Page): Promise<void> {
     try {
       await page.waitForFunction(() => {
@@ -284,13 +323,10 @@ export class ThermostatSession extends DurableObject<BrowserEnv> {
       }, undefined, { timeout: 15_000 });
     } catch (error) {
       if (!(error instanceof Error) || error.name !== "TimeoutError") throw error;
-      // A known login redirect proves authentication is needed. A slow portal
-      // bootstrap alone does not prove the saved login has expired.
-      const current = new URL(page.url());
-      if (current.protocol === "https:" && current.hostname === "auth.ecobee.com") {
-        await this.ctx.storage.delete("saved");
-        throw new PortalError("login_required");
-      }
+      // /authorize and callback pages can be an automatic redirect in progress.
+      // Only known interactive routes prove a human sign-in challenge; clearing
+      // saved state belongs to the coordinator after one normal SSO attempt.
+      if (this.portalLocation(page) === "interactive") throw new PortalError("login_required");
       throw new PortalError("site_changed");
     }
   }
@@ -307,14 +343,13 @@ export class ThermostatSession extends DurableObject<BrowserEnv> {
       throw error;
     }
     if (!result.ok) {
-      if (result.error === "login_required") await this.ctx.storage.delete("saved");
       throw new PortalError(result.error, result.diagnostics);
     }
     return "thermostats" in result ? result.thermostats : null;
   }
 
   private async expiredPortalToken(page: Page): Promise<boolean> {
-    return page.evaluate(() => {
+    return withDeadline(page.evaluate(() => {
       const expired = (value: unknown): boolean | undefined => {
         if (typeof value !== "string" || value.length > 32_768) return undefined;
         const parts = value.split(".");
@@ -339,7 +374,7 @@ export class ThermostatSession extends DurableObject<BrowserEnv> {
         const cookie = document.cookie.split(";").map(part => part.trim()).find(part => part.startsWith("_TOKEN="));
         return cookie ? expired(decodeURIComponent(cookie.slice("_TOKEN=".length))) === true : false;
       } catch { return false; }
-    });
+    }), 15_000, () => new PortalError("site_changed"));
   }
 
   private async withBackend<T>(operation: (backend: ThermostatBackend) => Promise<T>): Promise<T> {
@@ -356,18 +391,47 @@ export class ThermostatSession extends DurableObject<BrowserEnv> {
       const page = await context.newPage();
       capture = capturePortalDiagnostics(page);
       await page.goto(PORTAL_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
-      await this.waitForPortalReady(page);
-      if (await this.expiredPortalToken(page)) {
+      let renewalAttempted = false;
+      const renew = async (): Promise<void> => {
+        if (renewalAttempted) throw new PortalError("login_required");
+        renewalAttempted = true;
         // Use the user's existing SSO cookies in this same context once, before
-        // any requested action. A login/MFA prompt requires manual reconnection.
+        // any requested action. An automatic redirect timeout does not prove
+        // those cookies are invalid and must not erase the original snapshot.
         await page.goto("https://www.ecobee.com/en-us/", { waitUntil: "domcontentloaded", timeout: 30_000 });
         await this.openHomepageSignIn(page);
-        await this.waitForPortalReady(page);
-        if (await this.expiredPortalToken(page)) {
+        if (this.portalLocation(page) === "interactive") {
           await this.ctx.storage.delete("saved");
           throw new PortalError("login_required");
         }
+        try { await this.waitForPortalReady(page); }
+        catch (error) {
+          if (this.portalLocation(page) === "interactive") await this.ctx.storage.delete("saved");
+          throw error;
+        }
+        if (await this.expiredPortalToken(page)) {
+          // A stale token can be a transient callback/bootstrap failure while
+          // the SSO cookies remain usable. Do not replace or delete that state.
+          throw new PortalError("login_required");
+        }
+        // Authenticate a read before replacing recoverable credentials or
+        // dispatching any requested mutation. This never retries a write.
+        await this.portal(page, { type: "list" });
         await this.saveState(context);
+      };
+      const initial = this.portalLocation(page);
+      if (["homepage", "callback", "auth", "interactive"].includes(initial)) {
+        await renew();
+      } else {
+        try { await this.waitForPortalReady(page); }
+        catch (error) {
+          const current = this.portalLocation(page);
+          const recoverable = ["homepage", "callback", "auth", "interactive"].includes(current) ||
+            (current === "portal" && await this.portalHasNoToken(page));
+          if (!recoverable) throw error;
+          await renew();
+        }
+        if (!renewalAttempted && await this.expiredPortalToken(page)) await renew();
       }
       const backend: ThermostatBackend = {
         kind: "browser",
@@ -387,7 +451,6 @@ export class ThermostatSession extends DurableObject<BrowserEnv> {
             () => new PortalError(mutation ? "write_uncertain" : "timeout")); }
           catch (error) { throw error instanceof PortalError ? error : new PortalError(mutation ? "write_uncertain" : "request_failed"); }
           if (!result.ok) {
-            if (result.error === "login_required") await this.ctx.storage.delete("saved");
             throw new PortalError(result.error, result.diagnostics);
           }
           if (mutation && result.data !== null && typeof result.data === "object" && (result.data as { delivery?: unknown }).delivery === "accepted") writeDelivered = true;

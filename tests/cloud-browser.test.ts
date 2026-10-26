@@ -79,7 +79,7 @@ describe("hosted thermostat tenant object", () => {
     };
     mockBrowser.connect.mockResolvedValue({ newContext: async () => context, close: async () => undefined });
   });
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
   async function startAtHomepage(links: string[]) {
     const { instance, binding } = await tenant("tenant-a", false);
@@ -103,6 +103,56 @@ describe("hosted thermostat tenant object", () => {
 
   const jwt = (exp: unknown) => `e30.${btoa(JSON.stringify({ exp, private: "PRIVATE" })).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_")}.signature`;
 
+  async function restoredSession(initial: "homepage" | "auth" | "interactive" | "callback" | "missing" | "portal", renewal: "success" | "mfa" | "authorize_stalled" | "callback_stalled" | "api_rejected" | "network" = "success") {
+    const { instance, storage } = await tenant("tenant-a");
+    await post(instance, "/preferences", { allowWrites: true });
+    const original = storage.values.get("saved");
+    const events: string[] = [];
+    const issued: PortalOperation[] = [];
+    const now = Math.floor(Date.now() / 1000);
+    let token = jwt(now - 60);
+    let hasToken = initial !== "missing";
+    let first = true;
+    let url = "https://www.ecobee.com/consumerportal/index.html";
+    let renewed = false;
+    const manager = { loadTokens: vi.fn(), haveToken: () => hasToken };
+    const element = {};
+    vi.stubGlobal("location", { get protocol() { return new URL(url).protocol; }, get hostname() { return new URL(url).hostname; }, get pathname() { return new URL(url).pathname; } });
+    vi.stubGlobal("document", { querySelector: () => element, body: element, documentElement: element, get cookie() { return hasToken ? `_TOKEN=${token}` : ""; } });
+    vi.stubGlobal("window", { angular: { element: () => ({ injector: () => ({ get: () => manager }) }) }, ecobeeStore: { getState: () => ({ tokens: { token: hasToken ? token : "" } }) } });
+    const page = {
+      url: () => url,
+      goto: vi.fn(async (destination: string) => {
+        if (first) {
+          first = false;
+          url = initial === "homepage" ? "https://www.ecobee.com/en-us/" : initial === "auth" ? "https://auth.ecobee.com/authorize" : initial === "interactive" ? "https://auth.ecobee.com/u/login/identifier" : initial === "callback" ? "https://www.ecobee.com/home/authCallback" : destination;
+          return;
+        }
+        url = destination;
+        if (destination === "https://www.ecobee.com/en-us/" && renewal === "network") throw new Error("PRIVATE network detail");
+        if (destination === officialSignIn) {
+          events.push("renew"); renewed = true;
+          url = renewal === "mfa" ? "https://auth.ecobee.com/u/mfa-otp-challenge" : renewal === "authorize_stalled" ? "https://auth.ecobee.com/authorize" : renewal === "callback_stalled" ? "https://www.ecobee.com/home/authCallback" : "https://www.ecobee.com/consumerportal/index.html";
+          hasToken = true; token = jwt(now + 3600);
+        }
+      }),
+      locator: () => ({ evaluateAll: async (read: (anchors: { getAttribute: () => string }[]) => unknown) => read([{ getAttribute: () => officialSignIn }]) }),
+      waitForFunction: vi.fn(async (ready: () => boolean) => {
+        if (!ready()) { const error = new Error("Readiness timeout"); error.name = "TimeoutError"; throw error; }
+      }),
+      evaluate: vi.fn(async (fn: () => boolean, operation?: PortalOperation) => {
+        if (!operation) return fn();
+        issued.push(operation); events.push(operation.type);
+        if (operation.type === "list") return renewed && renewal === "api_rejected" ? { ok: false, error: "login_required" } : { ok: true, thermostats: [{ ...current }] };
+        if (operation.type === "setMode") current.mode = operation.mode;
+        return { ok: true };
+      }),
+    };
+    const storageState = vi.fn(async () => { events.push("save"); return { cookies: [{ name: "_TOKEN", value: token }], origins: [] }; });
+    mockBrowser.connect.mockResolvedValue({ newContext: async () => ({ newPage: async () => page, storageState }), close: async () => undefined });
+    return { instance, storage, original, events, issued, page, storageState };
+  }
+
   it.each([
     ["expired Redux", -60, 60, true],
     ["fresh Redux overrides old cookie", 60, -60, false],
@@ -121,6 +171,7 @@ describe("hosted thermostat tenant object", () => {
 
   it.each([true, false])("renews an expired session once before any write (SSO succeeds: %s)", async success => {
     const { instance, storage } = await tenant("tenant-a");
+    const original = storage.values.get("saved");
     await post(instance, "/preferences", { allowWrites: true });
     const now = Math.floor(Date.now() / 1000);
     let token = jwt(now - 60);
@@ -159,7 +210,63 @@ describe("hosted thermostat tenant object", () => {
     expect(events.filter(value => value === "renew")).toHaveLength(1);
     expect(events.filter(value => value === "setMode")).toHaveLength(success ? 1 : 0);
     expect(newContext).toHaveBeenCalledOnce();
-    expect(storage.values.has("saved")).toBe(success);
+    expect(storage.values.has("saved")).toBe(true);
+    if (!success) expect(storage.values.get("saved")).toBe(original);
+  });
+
+  it.each(["homepage", "auth", "callback", "missing"] as const)("renews a restored %s session before requiring the ready portal or issuing a mutation", async initial => {
+    const { instance, storage, original, events, issued, page, storageState } = await restoredSession(initial);
+    const result = await post(instance, "/control", { method: "setMode", args: { thermostat_id: current.id, mode: "cool" }, tokenAllowsWrites: true });
+    expect(result.status).toBe(200);
+    expect(events.filter(event => event === "renew")).toHaveLength(1);
+    expect(issued.filter(operation => operation.type === "setMode")).toHaveLength(1);
+    expect(events.indexOf("list")).toBeLessThan(events.indexOf("save"));
+    expect(events.indexOf("save")).toBeLessThan(events.indexOf("setMode"));
+    expect(page.goto.mock.calls.filter(([destination]) => destination === officialSignIn)).toHaveLength(1);
+    expect(storageState).toHaveBeenCalledWith({ indexedDB: true });
+    expect(storage.values.get("saved")).not.toBe(original);
+  });
+
+  it.each(["authorize_stalled", "callback_stalled", "api_rejected", "network"] as const)("preserves the exact recoverable snapshot when renewal encounters %s", async failure => {
+    const { instance, storage, original, issued, storageState } = await restoredSession("homepage", failure);
+    const result = await post(instance, "/control", { method: "setMode", args: { thermostat_id: current.id, mode: "cool" }, tokenAllowsWrites: true });
+    expect(result.ok).toBe(false);
+    expect(storage.values.get("saved")).toBe(original);
+    expect(storage.values.get("allowWrites")).toBe(true);
+    expect(issued.every(operation => operation.type === "list")).toBe(true);
+    expect(storageState).not.toHaveBeenCalled();
+    expect(JSON.stringify(await result.json())).not.toContain("PRIVATE");
+  });
+
+  it("requires manual sign-in only after the single SSO attempt reaches a known MFA challenge", async () => {
+    const { instance, storage, issued, events } = await restoredSession("auth", "mfa");
+    const result = await post(instance, "/control", { method: "setMode", args: { thermostat_id: current.id, mode: "cool" }, tokenAllowsWrites: true });
+    expect(result.status).toBe(409);
+    expect(await result.json()).toMatchObject({ error: "login_required" });
+    expect(events.filter(event => event === "renew")).toHaveLength(1);
+    expect(issued).toEqual([]);
+    expect(storage.values.has("saved")).toBe(false);
+    expect(storage.values.get("allowWrites")).toBe(true);
+  });
+
+  it("does not treat an old interactive URL as a new definitive challenge when renewal navigation fails", async () => {
+    const { instance, storage, original, issued, events } = await restoredSession("interactive", "network");
+    const result = await post(instance, "/control", { method: "list", args: {}, tokenAllowsWrites: false });
+    expect(result.status).toBe(503);
+    expect(storage.values.get("saved")).toBe(original);
+    expect(issued).toEqual([]);
+    expect(events).not.toContain("renew");
+  });
+
+  it.each(["portalHasNoToken", "expiredPortalToken"] as const)("bounds a frozen %s probe without deleting saved state", async method => {
+    vi.useFakeTimers();
+    const { instance, storage } = await tenant("tenant-a");
+    const original = storage.values.get("saved");
+    const probe = instance as unknown as Record<typeof method, (page: unknown) => Promise<boolean>>;
+    const pending = probe[method]({ evaluate: () => new Promise(() => undefined) }).catch(error => error);
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(await pending).toMatchObject({ code: "site_changed" });
+    expect(storage.values.get("saved")).toBe(original);
   });
 
   it("opens the discovered official login on the existing Live View page without changing scopes", async () => {
@@ -239,7 +346,7 @@ describe("hosted thermostat tenant object", () => {
     expect(result.status).toBe(409);
     expect(await result.json()).toMatchObject({ error: errorCode });
     expect(storage.values.has("saved")).toBe(keepSaved);
-    expect(evaluate).not.toHaveBeenCalled();
+    expect(evaluate.mock.calls.every(([, operation]) => operation === undefined)).toBe(true);
   });
 
   it("requires both account permission and the MCP token's write permission", async () => {

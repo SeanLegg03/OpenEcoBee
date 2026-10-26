@@ -137,6 +137,14 @@ describe("hosted app request security", () => {
     expect(tenantFetch).not.toHaveBeenCalled();
   });
 
+  it("returns reopened energy-report tabs to the connection controls without calling ecobee", async () => {
+    const { env, ctx, tenantFetch } = setup();
+    const response = await worker.fetch(await appRequest("/app/energy", { method: "GET" }), env, ctx);
+    expect(response.status).toBe(303);
+    expect(response.headers.get("Location")).toBe("/app");
+    expect(tenantFetch).not.toHaveBeenCalled();
+  });
+
   it("changes only the signed tenant's account preference after CSRF verification", async () => {
     const { env, ctx, idFromName, requests } = setup();
     const response = await worker.fetch(await appRequest("/app/preferences?userId=99999", { fields: { allowWrites: "yes", userId: "99999" } }), env, ctx);
