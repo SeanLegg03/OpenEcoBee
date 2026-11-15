@@ -151,8 +151,12 @@ async function defaultFetch(request: Request, env: Env): Promise<Response> {
     const routes: Record<string, string> = { "/app/finish": "/finish", "/app/disconnect": "/disconnect", "/app/preferences": "/preferences" };
     if (routes[path]) {
       const response = await internal(env, session.userId, routes[path], path === "/app/preferences" ? { allowWrites: form.get("allowWrites") === "yes" } : {});
-      if (!response.ok) return page("Connection needs attention", "<p>Sign in completely in the private browser, then try finishing again. Ecobee may require another login or block hosted browsers.</p><a href='/app'>Return to connection</a>");
-      return redirect("/app");
+      if (!response.ok) {
+        const result = await response.json() as { error?: string };
+        const code = result.error ?? "unknown";
+        return page("Connection needs attention",
+          `<p>Error code: ${escapeHtml(code)}</p><a href="/app">Return to connection</a>`);
+      }      return redirect("/app");
     }
   }
   return new Response("Not found.", { status: 404 });
