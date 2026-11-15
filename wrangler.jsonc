@@ -17,9 +17,10 @@
   "kv_namespaces": [
      { "binding": "OAUTH_KV", "id": "7f5688728cb84ff58cf5888614c18d5f" }
   ],
-  "vars": {
-       "ALLOWED_GITHUB_USERS": "SeanLegg03",
-      "PUBLIC_ORIGIN": "https://openecobee-mcp.seanlegg.workers.dev"
+    "vars": {
+    "GITHUB_CLIENT_ID": "Ov23liM82mFSRrtbICp3",
+    "ALLOWED_GITHUB_USERS": "SeanLegg03",
+    "PUBLIC_ORIGIN": "https://openecobee-mcp.seanlegg.workers.dev"
   },
   "observability": { "enabled": false }
 }
