@@ -15,11 +15,11 @@
     { "tag": "v1", "new_sqlite_classes": ["ThermostatSession"] }
   ],
   "kv_namespaces": [
-    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_OAUTH_KV_NAMESPACE_ID" }
+     { "binding": "OAUTH_KV", "id": "7f5688728cb84ff58cf5888614c18d5f" }
   ],
   "vars": {
-    "ALLOWED_GITHUB_USERS": "eliseorobles",
-    "PUBLIC_ORIGIN": "https://openecobee-mcp.YOUR_SUBDOMAIN.workers.dev"
+       "ALLOWED_GITHUB_USERS": "SeanLegg03",
+      "PUBLIC_ORIGIN": "https://openecobee-mcp.seanlegg.workers.dev"
   },
   "observability": { "enabled": false }
 }
