@@ -27,6 +27,7 @@ export type PortalResult =
   | { ok: false; error: PortalErrorCode; diagnostics?: PortalDiagnostics };
 
 export interface PortalDiagnostics {
+    validation?: string;
   phase: "read" | "write";
   apiCode?: number;
   httpStatus?: number;
@@ -38,6 +39,10 @@ export function portalDiagnosticSuffix(value: unknown): string {
   const detail = value as Record<string, unknown>;
   if (detail.phase !== "read" && detail.phase !== "write") return "";
   const parts: string[] = [detail.phase];
+    if (typeof detail.validation === "string" &&
+      /^[A-Za-z][A-Za-z0-9.]{0,60}$/.test(detail.validation)) {
+    parts.push(`validation: ${detail.validation}`);
+  }
   if (typeof detail.apiCode === "number" && Number.isInteger(detail.apiCode) && detail.apiCode >= 0 && detail.apiCode <= 9999) {
     parts.push(`ecobee API code ${detail.apiCode}`);
   }
@@ -161,8 +166,50 @@ export async function runPortalOperation(operation: PortalOperation): Promise<Po
     if (status === "auth") return fail("login_required", diagnose(response));
     if (status === "failed") return fail("request_failed", diagnose(response));
     if (status !== "ok") return fail("invalid_response", diagnose(response));
-    const values = record(response)?.thermostatList;
-    if (!Array.isArray(values) || values.length > 200) return fail("invalid_response");
+     const values = record(response)?.thermostatList;
+    const invalid = (validation: string): PortalResult =>
+      fail("invalid_response", { phase: "read", validation });
+
+    if (!Array.isArray(values)) return invalid("thermostatList");
+    if (values.length > 200) return invalid("thermostatCount");
+
+    const checkedIds = new Set<string>();
+    for (const value of values) {
+      const t = record(value);
+      if (!t) return invalid("thermostat");
+      const r = record(t.runtime);
+      const s = record(t.settings);
+      if (!r) return invalid("runtime");
+      if (!s) return invalid("settings");
+      if (typeof t.identifier !== "string" ||
+          !/^[0-9]{1,32}$/.test(t.identifier)) {
+        return invalid("identifier");
+      }
+      if (checkedIds.has(t.identifier)) return invalid("duplicateIdentifier");
+      checkedIds.add(t.identifier);
+
+      const checks: [string, unknown, number, number][] = [
+        ["runtime.actualTemperature", r.actualTemperature, -1000, 2000],
+        ["runtime.actualHumidity", r.actualHumidity, 0, 100],
+        ["runtime.desiredHeat", r.desiredHeat, -400, 2200],
+        ["runtime.desiredCool", r.desiredCool, -400, 2200],
+        ["settings.heatRangeLow", s.heatRangeLow, -400, 2200],
+        ["settings.heatRangeHigh", s.heatRangeHigh, -400, 2200],
+        ["settings.coolRangeLow", s.coolRangeLow, -400, 2200],
+        ["settings.coolRangeHigh", s.coolRangeHigh, -400, 2200],
+        ["settings.heatCoolMinDelta", s.heatCoolMinDelta, 0, 500],
+      ];
+      for (const [field, value, low, high] of checks) {
+        if (!finite(value, low, high)) return invalid(field);
+      }
+      if (typeof r.connected !== "boolean") return invalid("runtime.connected");
+      if ((s.heatRangeLow as number) > (s.heatRangeHigh as number)) {
+        return invalid("settings.heatRangeOrder");
+      }
+      if ((s.coolRangeLow as number) > (s.coolRangeHigh as number)) {
+        return invalid("settings.coolRangeOrder");
+      }
+    }
     const thermostats: Thermostat[] = [];
     const seen = new Set<string>();
     let targetHasDemandResponse = false;
